@@ -1,0 +1,61 @@
+# 美股量化交易系统配置
+
+# 股票列表
+tickers:
+  - AAPL    # Apple
+  - MSFT    # Microsoft
+  - GOOGL   # Google
+  - AMZN    # Amazon
+  - TSLA    # Tesla
+  - META    # Meta
+  - NVDA    # NVIDIA
+  - SPY     # S&P 500 ETF
+  - QQQ     # Nasdaq 100 ETF
+
+# 回测参数
+backtest:
+  initial_cash: 10000      # 初始资金 ($)
+  commission: 10           # 每笔交易佣金 ($)
+  start_date: null         # 开始日期，null=自动推算（最近2年）
+  end_date: null           # 结束日期，null=今天
+  
+# 策略参数
+strategies:
+  sma_crossover:
+    enabled: true
+    short_window: 20       # 短期移动平均线窗口
+    long_window: 50        # 长期移动平均线窗口
+  
+  rsi:
+    enabled: true
+    period: 14
+    oversold: 30
+    overbought: 70
+  
+  macd:
+    enabled: true
+    fast: 12
+    slow: 26
+    signal: 9
+
+# 信号生成参数
+signals:
+  atr_period: 14           # ATR 计算周期
+  support_lookback: 20     # 支撑位回看周期
+  stop_loss_atr_multiplier: 0.5  # 止损线 = 支撑 - ATR * 倍数
+  target_atr_multiplier: 1.0     # 目标价 = 阻力 + ATR * 倍数
+
+# 数据和缓存
+data:
+  cache_dir: ./data/cache  # 数据缓存目录
+  use_cache: true          # 是否使用缓存
+  auto_update: true        # 是否自动更新缓存
+
+# 日报设置
+daily_report:
+  enabled: true
+  output_dir: ./reports    # 报告输出目录
+  telegram_enabled: false  # 是否发送到 Telegram（需要配置 token 和 chat_id）
+  
+# 其他参数
+risk_free_rate: 0.02       # 无风险利率（夏普比率计算）
