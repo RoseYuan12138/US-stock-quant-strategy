@@ -1,210 +1,221 @@
 #!/usr/bin/env python3
 """
-美股量化交易系统 - 日信号生成脚本
-每日生成最新的交易信号和建议
+每日信号生成 — 基于 V5 组合策略
+使用当前架构：基本面 + 动量 + Regime + Earnings + Insider
+输出：当日选股建议 + 市场环境判断
 """
 
 import sys
-import argparse
 import json
+import argparse
+import logging
 from pathlib import Path
 from datetime import datetime
 
-# 添加项目根目录到 Python 路径
 sys.path.insert(0, str(Path(__file__).parent))
 
 from data.data_fetcher import DataFetcher
-from strategy.strategies import StrategyEnsemble
-from signals.signal_generator import SignalGenerator
-import logging
+from data.fundamental_fetcher import FundamentalFetcher, ValueScreener
+from strategy.momentum import MomentumScorer
+from strategy.regime_filter import RegimeFilter
+from strategy.portfolio_strategy import PortfolioConfig, PortfolioStrategy
+from strategy.earnings_surprise import EarningsSurpriseScorer
+from strategy.insider_signal import InsiderSignalScorer
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.WARNING, format='%(message)s')
 logger = logging.getLogger(__name__)
 
+SP100_TICKERS = [
+    'AAPL', 'MSFT', 'GOOGL', 'GOOG', 'AMZN', 'NVDA', 'META', 'TSLA',
+    'AVGO', 'ORCL', 'CRM', 'AMD', 'ADBE', 'INTC', 'CSCO', 'QCOM',
+    'TXN', 'IBM', 'INTU', 'AMAT',
+    'JPM', 'BAC', 'GS', 'MS', 'WFC', 'C', 'BLK', 'SCHW', 'AXP', 'BK',
+    'USB', 'COF',
+    'UNH', 'JNJ', 'LLY', 'ABBV', 'MRK', 'PFE', 'TMO', 'ABT', 'DHR',
+    'BMY', 'AMGN', 'GILD', 'MDT',
+    'WMT', 'HD', 'PG', 'KO', 'PEP', 'COST', 'MCD', 'NKE', 'SBUX',
+    'TGT', 'LOW',
+    'CAT', 'BA', 'HON', 'GE', 'RTX', 'UPS', 'DE', 'LMT', 'MMM',
+    'XOM', 'CVX', 'COP', 'SLB',
+    'DIS', 'CMCSA', 'NFLX', 'T', 'VZ', 'TMUS',
+    'NEE', 'DUK', 'SO',
+    'V', 'MA', 'PYPL', 'ACN', 'LIN', 'UNP', 'PM',
+]
 
-def load_tickers_from_config(config_path='./config/config.yaml'):
-    """从配置文件加载股票列表"""
-    try:
-        import yaml
-        with open(config_path, 'r') as f:
-            config = yaml.safe_load(f)
-            return config.get('tickers', [])
-    except ImportError:
-        logger.warning("PyYAML 未安装，使用默认股票列表")
-        return ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA']
-    except FileNotFoundError:
-        logger.warning(f"配置文件 {config_path} 不存在，使用默认股票列表")
-        return ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA']
-
-
-def generate_signals_for_tickers(tickers, output_dir='./reports'):
-    """
-    为多只股票生成交易信号
-    
-    Args:
-        tickers: 股票代码列表
-        output_dir: 输出目录
-    
-    Returns:
-        dict: 所有股票的信号
-    """
-    # 初始化
-    fetcher = DataFetcher()
-    ensemble = StrategyEnsemble()
-    generator = SignalGenerator(strategies=ensemble.strategies)
-    
-    logger.info(f"为 {len(tickers)} 只股票生成信号...")
-    
-    all_signals = {}
-    successful = 0
-    
-    for ticker in tickers:
-        try:
-            # 获取数据
-            data = fetcher.fetch_historical_data(ticker)
-            
-            if data is None or len(data) < 50:
-                logger.warning(f"{ticker}: 数据不足或获取失败")
-                continue
-            
-            # 生成信号
-            signal = generator.generate_signals(ticker, data)
-            all_signals[ticker] = signal
-            
-            if signal['status'] == 'OK':
-                successful += 1
-                logger.info(f"✓ {ticker}: {signal['signal']} (置信度 {signal['signal_confidence']:.0f}%)")
-            else:
-                logger.warning(f"✗ {ticker}: {signal.get('message', 'Unknown error')}")
-        
-        except Exception as e:
-            logger.error(f"{ticker}: {e}")
-    
-    logger.info(f"成功生成 {successful}/{len(tickers)} 只股票的信号")
-    
-    # 生成日报
-    report_text = generator.generate_daily_report(all_signals)
-    
-    # 保存报告
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-    
-    # 文本报告
-    report_file = Path(output_dir) / f"daily_signals_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-    with open(report_file, 'w', encoding='utf-8') as f:
-        f.write(report_text)
-    logger.info(f"日报已保存: {report_file}")
-    
-    # JSON 报告（便于后续处理和 Telegram 集成）
-    json_file = Path(output_dir) / f"daily_signals_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    with open(json_file, 'w', encoding='utf-8') as f:
-        json.dump(all_signals, f, indent=2, default=str)
-    logger.info(f"JSON 信号已保存: {json_file}")
-    
-    return all_signals, report_text
-
-
-def print_console_report(report_text):
-    """在控制台打印报告"""
-    print("\n" + report_text)
-
-
-def send_telegram_report(report_text, token=None, chat_id=None):
-    """
-    发送报告到 Telegram（可选功能）
-    
-    Args:
-        report_text: 报告文本
-        token: Telegram bot token
-        chat_id: 聊天 ID
-    """
-    if not token or not chat_id:
-        logger.info("Telegram 未配置，跳过发送")
-        return False
-    
-    try:
-        import requests
-        
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        data = {
-            'chat_id': chat_id,
-            'text': report_text,
-            'parse_mode': 'HTML'
-        }
-        
-        response = requests.post(url, json=data)
-        if response.status_code == 200:
-            logger.info("报告已发送到 Telegram")
-            return True
-        else:
-            logger.error(f"Telegram 发送失败: {response.status_code}")
-            return False
-    
-    except ImportError:
-        logger.warning("requests 库未安装，无法发送 Telegram 消息")
-        return False
-    except Exception as e:
-        logger.error(f"Telegram 发送错误: {e}")
-        return False
+MACRO_TICKERS = {
+    'tnx': '^TNX', 'irx': '^IRX', 'vix': '^VIX', 'hyg': 'HYG', 'lqd': 'LQD',
+}
 
 
 def main():
-    """主函数"""
-    parser = argparse.ArgumentParser(
-        description='美股量化交易系统 - 日信号生成',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='''
-示例：
-  # 为默认股票列表生成信号
-  python run_daily_signals.py
-  
-  # 为指定股票生成信号
-  python run_daily_signals.py --tickers AAPL MSFT GOOGL
-  
-  # 指定输出目录
-  python run_daily_signals.py --output reports/signals
-  
-  # 发送到 Telegram
-  python run_daily_signals.py --telegram-token YOUR_BOT_TOKEN --telegram-chat YOUR_CHAT_ID
-        '''
-    )
-    
-    parser.add_argument('--tickers', nargs='+', help='股票代码列表')
+    parser = argparse.ArgumentParser(description='每日选股信号生成')
+    parser.add_argument('--tickers', nargs='+', help='自定义股票列表')
     parser.add_argument('--output', type=str, default='./reports', help='输出目录')
-    parser.add_argument('--telegram-token', type=str, help='Telegram Bot Token')
-    parser.add_argument('--telegram-chat', type=str, help='Telegram Chat ID')
-    parser.add_argument('--no-print', action='store_true', help='不在控制台打印报告')
-    
+    parser.add_argument('--config', type=str, choices=['standard', 'aggressive', 'conservative'],
+                        default='standard', help='策略配置档位')
     args = parser.parse_args()
-    
-    # 确定股票列表
-    if args.tickers:
-        tickers = args.tickers
+
+    tickers = args.tickers or SP100_TICKERS
+    tickers = list(dict.fromkeys(tickers))
+
+    # 配置档位
+    if args.config == 'aggressive':
+        config = PortfolioConfig(
+            top_n=15, min_combined_score=45, min_momentum_score=30,
+            weight_fundamental=0.4, weight_momentum=0.4, weight_analyst=0.2,
+            max_single_weight=0.10, spy_base_weight=0.10,
+            trailing_stop_pct=0.30, use_regime_filter=True,
+        )
+    elif args.config == 'conservative':
+        config = PortfolioConfig(
+            top_n=8, min_combined_score=60, min_momentum_score=45,
+            weight_fundamental=0.6, weight_momentum=0.2, weight_analyst=0.2,
+            max_single_weight=0.12, spy_base_weight=0.25,
+            trailing_stop_pct=0.20, use_regime_filter=True,
+        )
     else:
-        tickers = load_tickers_from_config()
-    
-    logger.info("="*70)
-    logger.info(f"美股交易信号生成")
-    logger.info(f"股票: {', '.join(tickers)}")
-    logger.info("="*70)
-    
-    # 生成信号
-    signals, report_text = generate_signals_for_tickers(tickers, args.output)
-    
-    # 在控制台打印
-    if not args.no_print:
-        print_console_report(report_text)
-    
-    # 发送 Telegram（可选）
-    if args.telegram_token and args.telegram_chat:
-        send_telegram_report(report_text, args.telegram_token, args.telegram_chat)
-    
-    logger.info("="*70)
-    logger.info("信号生成完成")
-    logger.info("="*70)
+        config = PortfolioConfig(
+            top_n=10, min_combined_score=55, min_momentum_score=40,
+            weight_fundamental=0.5, weight_momentum=0.3, weight_analyst=0.2,
+            max_single_weight=0.12, spy_base_weight=0.20,
+            trailing_stop_pct=0.25, use_regime_filter=True,
+        )
+
+    strategy = PortfolioStrategy(config)
+    momentum_scorer = MomentumScorer()
+    regime_filter = RegimeFilter()
+    earnings_scorer = EarningsSurpriseScorer()
+    insider_scorer = InsiderSignalScorer()
+    price_fetcher = DataFetcher(cache_dir='./data/cache')
+    fund_fetcher = FundamentalFetcher(cache_dir='./data/cache/fundamentals')
+    screener = ValueScreener()
+
+    now = datetime.now()
+    print(f"{'='*70}")
+    print(f"  每日选股信号 — {now.strftime('%Y-%m-%d %H:%M')}")
+    print(f"  配置: {args.config.upper()} | 标的池: {len(tickers)} 只")
+    print(f"{'='*70}")
+
+    # 1. 市场环境
+    print(f"\n[1] 市场环境...")
+    spy_data = price_fetcher.fetch_historical_data('SPY')
+    macro_data = {}
+    for key, ticker in MACRO_TICKERS.items():
+        data = price_fetcher.fetch_historical_data(ticker)
+        if data is not None and len(data) > 50:
+            macro_data[key] = data
+
+    regime = regime_filter.get_regime(spy_data, macro_data=macro_data)
+    regime_name = regime.get('regime', 'UNKNOWN')
+    composite = regime.get('composite_score', 0)
+    multiplier = regime.get('position_multiplier', 1.0)
+
+    regime_emoji = {'BULL': 'BULL', 'CAUTION': 'CAUTION', 'BEAR': 'BEAR', 'RECOVERY': 'RECOVERY'}
+    print(f"  市场环境: {regime_emoji.get(regime_name, regime_name)} (composite={composite:.0f}, 仓位={multiplier:.0%})")
+
+    # 2. 价格 + 动量
+    print(f"\n[2] 价格和动量...")
+    price_data = {}
+    momentum_scores = {}
+    for ticker in tickers:
+        data = price_fetcher.fetch_historical_data(ticker)
+        if data is not None and len(data) > 50:
+            price_data[ticker] = data
+            mom = momentum_scorer.calculate_momentum(data)
+            if mom is not None:
+                momentum_scores[ticker] = mom
+    print(f"  有效: {len(price_data)}/{len(tickers)}")
+
+    # 3. 基本面
+    print(f"\n[3] 基本面...")
+    fund_data = fund_fetcher.fetch_batch(list(price_data.keys()))
+    screening_df = screener.screen_universe(fund_data)
+    fundamental_scores = {}
+    short_interest = {}
+    for _, row in screening_df.iterrows():
+        fundamental_scores[row['ticker']] = {
+            'total_score': row['total_score'],
+            'analyst_score': row.get('analyst_score', row['total_score']),
+        }
+    for tk, fd in fund_data.items():
+        si = fd.get('short_percent_of_float')
+        if si is not None:
+            short_interest[tk] = si
+
+    # 4. Earnings Surprise 调整
+    print(f"\n[4] Earnings Surprise...")
+    for ticker in fundamental_scores:
+        earnings_scorer.get_earnings_data(ticker)
+        es = earnings_scorer.score_at_date(ticker, datetime.now())
+        if es.get('data_available'):
+            orig = fundamental_scores[ticker]['total_score']
+            adjusted = orig * 0.8 + es['earnings_score'] * 0.2
+            fundamental_scores[ticker]['total_score'] = adjusted
+
+    # 5. Insider Trading
+    print(f"\n[5] Insider Trading...")
+    insider_scores = {}
+    for ticker in fundamental_scores:
+        insider_scorer.get_insider_data(ticker)
+    insider_scores = insider_scorer.score_universe(
+        list(fundamental_scores.keys()), datetime.now()
+    )
+
+    # 6. 选股
+    print(f"\n[6] 选股...")
+    selected = strategy.select_stocks(
+        fundamental_scores, momentum_scores,
+        short_interest=short_interest,
+        insider_scores=insider_scores,
+    )
+
+    # 输出报告
+    print(f"\n{'='*70}")
+    print(f"  选股结果 — {args.config.upper()} 配置")
+    print(f"  市场: {regime_name} | 建议仓位: {multiplier:.0%}")
+    print(f"{'='*70}")
+
+    if not selected:
+        print(f"\n  无符合条件的股票。")
+    else:
+        print(f"\n  {'Rank':>4s} {'Ticker':6s} {'综合分':>6s} {'基本面':>6s} {'动量':>6s} "
+              f"{'分析师':>6s} {'Insider':>7s} {'权重':>6s} {'200SMA':>6s}")
+        print(f"  {'-'*60}")
+        for i, s in enumerate(selected):
+            sma = 'Y' if s.get('above_200sma') else 'N'
+            print(f"  {i+1:4d} {s['ticker']:6s} {s['combined_score']:6.1f} "
+                  f"{s['fundamental_score']:6.1f} {s['momentum_score']:6.1f} "
+                  f"{s['analyst_score']:6.1f} {s.get('insider_bonus', 0):+6.1f} "
+                  f"{s['weight']:6.1%} {sma:>6s}")
+
+    # 仓位建议
+    print(f"\n  --- 仓位建议 ---")
+    print(f"  SPY 底仓: {config.spy_base_weight * multiplier:.0%}")
+    print(f"  个股总仓位: {(1 - config.spy_base_weight) * multiplier:.0%}")
+    print(f"  现金: {1 - multiplier:.0%}")
+
+    # 保存 JSON
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ts = now.strftime('%Y%m%d_%H%M')
+
+    signal_data = {
+        'date': now.isoformat(),
+        'config': args.config,
+        'regime': {
+            'name': regime_name,
+            'composite_score': composite,
+            'position_multiplier': multiplier,
+        },
+        'selected': selected,
+        'total_candidates': len(fundamental_scores),
+        'passed_momentum': len(momentum_scores),
+    }
+
+    json_file = output_dir / f"daily_signal_{ts}.json"
+    with open(json_file, 'w') as f:
+        json.dump(signal_data, f, indent=2, default=str)
+    print(f"\n  JSON: {json_file}")
 
 
 if __name__ == '__main__':
