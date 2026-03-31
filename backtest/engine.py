@@ -6,7 +6,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 
-from config import FMP_CACHE, V7Config
+from config import FMP_CACHE, V7Config, V8Config
 from data.fmp_loader import FMPDataLoader
 from strategy.base import StrategyBase
 
