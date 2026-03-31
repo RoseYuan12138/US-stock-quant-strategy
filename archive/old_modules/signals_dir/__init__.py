@@ -1,0 +1,4 @@
+"""交易信号生成模块"""
+from .signal_generator import SignalGenerator
+
+__all__ = ['SignalGenerator']

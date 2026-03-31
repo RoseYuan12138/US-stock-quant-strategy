@@ -1,4 +1,4 @@
-"""数据获取模块"""
-from .data_fetcher import DataFetcher
+"""Data layer - FMP data loading."""
+from .fmp_loader import FMPDataLoader
 
-__all__ = ['DataFetcher']
+__all__ = ["FMPDataLoader"]

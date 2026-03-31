@@ -193,7 +193,86 @@ OOS 期间（2016-2017）FMP Alpha 比 yfinance 高约 +2~5pp，可能原因：
 
 ---
 
-## 五、数据源切换结论
+## 五、V7 Sector-Neutral 回测（2025-01-02 ~ 2026-03-30，FMP 数据）
+
+> 脚本：`run_backtest.py` | 策略：V7 Sector-Neutral Multi-Factor | 数据源：FMP parquet only
+> V7 与 V3 是**完全不同的策略架构**（见下方对比），此处记录 V7 在 FMP 数据上的独立表现。
+
+### 5.1 V3 vs V7 架构差异
+
+| 维度 | V3 (上文 一~四 章) | V7 |
+|------|-------------------|-----|
+| **因子数** | 5 个（静态权重 50/30/20） | 14 个（IC 动态加权） |
+| **选股** | 全市场 top 10 等权 | Sector-neutral，每板块 top 2 |
+| **Universe** | S&P 100 固定 | S&P 500 历史成分（消除幸存者偏差） |
+| **再平衡** | 月度 | 双周（14 天） |
+| **前视偏差** | 可能存在 | 使用 filingDate 消除 |
+| **数据源** | yfinance / FMP 均可 | 仅 FMP parquet |
+
+### 5.2 同口径对比：V3 FMP vs V7 FMP（2025-01 ~ 2026-03）
+
+| 指标 | **V3 FMP (Standard)** | **V7 FMP** | 差异 | 说明 |
+|------|----------------------|------------|------|------|
+| **总收益** | -2.0% | **-1.94%** | +0.06pp | 基本一致 |
+| **Alpha（年化）** | -11.5% | **-8.31%** | **+3.2pp ↑** | V7 跑输幅度更小 |
+| **Sharpe** | -0.16 | **-0.262** | -0.10 | V3 略好 |
+| **最大回撤** | -14.2% | **-20.49%** | **-6.3pp ↓** | V7 回撤更大 |
+| **胜率** | 48.9% | **47.7%** | -1.2pp | 基本一致 |
+| **SPY 总收益** | +12.1% | **+8.10%** | -4.0pp | 数据源差异（时间截止略不同） |
+| **SPY Sharpe** | 0.50 | **0.218** | -0.28 | 同上 |
+| **Tracking Error** | — | **12.25%** | — | — |
+| **Information Ratio** | — | **-0.678** | — | — |
+| **Alpha t-stat** | ≈-1.18 | **-0.751** | — | V7 负向更弱（更接近 0） |
+| **交易次数** | — | 333 | — | 32 次再平衡 |
+
+> **对比小结**：
+> - **总收益几乎相同**（-2.0% vs -1.94%），两个策略在这段时间结果接近
+> - **V7 Alpha 更好**（-8.31% vs -11.5%），得益于 sector-neutral 和 IC 加权
+> - **V7 回撤更大**（-20.49% vs -14.2%），sector-neutral 在市场普跌时分散更广，反而放大了回撤
+> - **V7 Alpha t-stat 更接近 0**（-0.751 vs -1.18），说明 V7 的负 alpha 统计上更不显著
+
+### 5.3 V7 Factor IC（2025-01 ~ 2026-03）
+
+| 因子 | Mean IC | IC-IR | Hit Rate | 说明 |
+|------|---------|-------|----------|------|
+| **gross_margin** | -0.023 | -0.364 | 39% | 最差 |
+| **mom_6m** | +0.020 | +0.171 | 65% | 6 月动量，hit rate 最高 |
+| **mom_1m_rev** | -0.019 | -0.187 | 32% | 短期反转无效 |
+| **mom_12m_skip1** | +0.017 | +0.162 | 55% | — |
+| **roe** | -0.015 | -0.284 | 39% | 负向 |
+| **analyst_revision** | +0.015 | +0.345 | 61% | 分析师修正有效 |
+| **operating_margin** | -0.013 | -0.231 | 45% | — |
+| **sue** | +0.012 | +0.318 | **71%** | Earnings surprise hit rate 高 |
+| **fcf_yield** | -0.009 | -0.151 | 45% | 弱负 |
+| **insider_signal** | +0.009 | +0.194 | 61% | — |
+| **book_yield** | +0.007 | +0.162 | 58% | — |
+| **congress_signal** | -0.007 | -0.148 | 45% | 无效 |
+| **earnings_yield** | -0.005 | -0.122 | 45% | 价值因子弱负 |
+| **composite** | +0.004 | +0.070 | 52% | 综合因子弱正 |
+| **accruals** | -0.004 | -0.078 | 48% | — |
+
+> **Factor IC 小结**：15 个月区间内因子整体偏弱。mom_6m（hit 65%）和 sue（hit 71%）相对可靠。
+> composite IC 仅 +0.004，IC-IR 0.07，说明这段市场因子选股能力有限。
+
+### 5.4 V7 板块配置（平均）
+
+| 板块 | 权重 |
+|------|------|
+| Technology | 15.5% |
+| Industrials | 14.5% |
+| Financial Services | 13.4% |
+| Healthcare | 11.3% |
+| Consumer Cyclical | 10.0% |
+| Consumer Defensive | 6.7% |
+| Utilities | 6.1% |
+| Real Estate | 5.9% |
+| Energy | 4.4% |
+| Basic Materials | 3.8% |
+| Communication Services | 3.8% |
+
+---
+
+## 六、V3 数据源切换结论（yfinance vs FMP）
 
 | 维度 | 结论 |
 |------|------|
@@ -214,10 +293,11 @@ OOS 期间（2016-2017）FMP Alpha 比 yfinance 高约 +2~5pp，可能原因：
 
 ---
 
-## 六、原始报告文件
+## 七、原始报告文件
 
 | 数据源 | OOS | 近期 2025-2026 | 主回测 2018-2025 |
 |--------|-----|----------------|----------------|
 | **yfinance (baseline)** | `reports/oos_test_20260330_1507.json` | `reports/backtest_2025_2026_20260330_1508.json` | `reports/portfolio_v3_validation_20260330_1540.json` |
 | **yfinance (精确tstat版)** | `reports/oos_test_20260330_1723.json` | `reports/backtest_2025_2026_20260330_1723.json` | `reports/portfolio_v3_validation_20260330_1723.json` |
-| **FMP** | `reports/oos_test_20260330_1618.json` | `reports/backtest_2025_2026_20260330_1625.json` | `reports/portfolio_v3_validation_20260330_1624.json` |
+| **FMP (V3)** | `reports/oos_test_20260330_1618.json` | `reports/backtest_2025_2026_20260330_1625.json` | `reports/portfolio_v3_validation_20260330_1624.json` |
+| **FMP (V7)** | — | `reports/v7_report.json` (2025-01~2026-03) | — |

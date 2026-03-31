@@ -1,0 +1,25 @@
+# V7 Sector-Neutral Multi-Factor Strategy Configuration
+
+# === Strategy Parameters ===
+strategy:
+  top_n_per_sector: 2           # Top N stocks per sector
+  max_total_holdings: 25        # Max positions
+  min_zscore: -0.5              # Minimum composite z-score to enter
+  rebalance_days: 14            # Bi-weekly rebalancing
+  slippage_bps: 10.0            # One-way slippage in bps
+  commission: 0.0               # Per-trade commission ($)
+  trailing_stop_pct: 0.20       # 20% trailing stop
+  max_single_weight: 0.08       # 8% max per stock
+  ic_lookback_months: 12        # IC estimation window
+  factor_decay_days: 60         # Signal half-life for time-sensitive factors
+  initial_capital: 100000       # Backtest initial capital
+
+# === Data Source ===
+data:
+  source: fmp                   # Financial Modeling Prep
+  cache_dir: ./fmp-datasource/cache
+  price_type: split_adjusted    # No dividend adjustment
+
+# === Risk Management ===
+risk:
+  risk_free_rate: 0.04          # For Sharpe calculation
