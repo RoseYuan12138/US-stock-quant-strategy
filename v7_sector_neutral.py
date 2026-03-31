@@ -1151,70 +1151,47 @@ class V7Backtester:
     def _download_prices(self, tickers: List[str],
                          start: pd.Timestamp,
                          end: pd.Timestamp) -> Dict[str, pd.DataFrame]:
-        """Download price data for all tickers via yfinance."""
-        import yfinance as yf
-
+        """Load price data for all tickers from FMP parquet cache."""
         # Need extra lookback for momentum calculation
         price_start = start - pd.Timedelta(days=400)
 
+        prices_dir = os.path.join(FMP_CACHE, "prices")
         price_data = {}
-        batch_size = 50
-        ticker_list = list(tickers)
 
-        for i in range(0, len(ticker_list), batch_size):
-            batch = ticker_list[i:i+batch_size]
-            try:
-                data = yf.download(
-                    batch,
-                    start=price_start.strftime("%Y-%m-%d"),
-                    end=(end + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
-                    progress=False,
-                    group_by="ticker",
-                    auto_adjust=True,
-                    threads=True,
-                )
-
-                if len(batch) == 1:
-                    sym = batch[0]
-                    if not data.empty:
-                        price_data[sym] = data
-                else:
-                    for sym in batch:
-                        try:
-                            if sym in data.columns.get_level_values(0):
-                                df = data[sym].dropna(how="all")
-                                if not df.empty:
-                                    price_data[sym] = df
-                        except Exception:
-                            continue
-            except Exception as e:
-                print(f"  ⚠️ Batch download error: {e}")
+        for sym in tickers:
+            path = os.path.join(prices_dir, f"{sym}.parquet")
+            if not os.path.exists(path):
                 continue
-
-            if (i + batch_size) % 200 == 0:
-                print(f"  Downloaded {min(i+batch_size, len(ticker_list))}/"
-                      f"{len(ticker_list)} tickers...")
+            try:
+                df = pd.read_parquet(path)
+                df["date"] = pd.to_datetime(df["date"])
+                df = df.set_index("date").sort_index()
+                df.columns = [c.capitalize() for c in df.columns]
+                df = df.loc[price_start:end]
+                if not df.empty:
+                    price_data[sym] = df
+            except Exception as e:
+                print(f"  ⚠️ Failed to load {sym}: {e}")
+                continue
 
         return price_data
 
     def _get_spy_prices(self, start: pd.Timestamp,
                         end: pd.Timestamp) -> pd.Series:
-        """Get SPY price series via yfinance."""
-        import yfinance as yf
+        """Get SPY price series from FMP parquet cache."""
         price_start = start - pd.Timedelta(days=400)
-        spy = yf.download(
-            "SPY",
-            start=price_start.strftime("%Y-%m-%d"),
-            end=(end + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
-            progress=False,
-            auto_adjust=True,
-        )
-        if not spy.empty:
-            close = spy["Close"]
-            if isinstance(close, pd.DataFrame):
-                close = close.iloc[:, 0]
-            return close
-        return pd.Series()
+        path = os.path.join(FMP_CACHE, "prices", "SPY.parquet")
+        if not os.path.exists(path):
+            return pd.Series()
+        try:
+            df = pd.read_parquet(path)
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.set_index("date").sort_index()
+            df = df.loc[price_start:end]
+            return df["close"].rename(None) if not df.empty else pd.Series()
+        except Exception as e:
+            print(f"  ⚠️ Failed to load SPY: {e}")
+            return pd.Series()
 
     def _compute_sector_weights(self) -> Dict[str, float]:
         """Compute benchmark sector weights (equal weight per sector member)."""
