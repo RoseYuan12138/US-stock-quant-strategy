@@ -2,6 +2,8 @@
 data/cache/
 data/*.csv
 *.csv
+fmp-datasource/cache/
+*.parquet
 
 # 报告和输出
 reports/
