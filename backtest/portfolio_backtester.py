@@ -54,6 +54,14 @@ class PortfolioBacktester:
         self.hist_fundamental_fetcher = HistoricalFundamentalFetcher()
         self.earnings_scorer = EarningsSurpriseScorer()
 
+    def _apply_slippage(self, price, action):
+        """应用滑点：买入价格偏高，卖出价格偏低"""
+        slippage = self.config.slippage_bps / 10000
+        if action == 'BUY':
+            return price * (1 + slippage)
+        else:  # SELL
+            return price * (1 - slippage)
+
     def run(self, price_data_dict, fundamental_scores, benchmark_data,
             start_date='2023-01-01', end_date='2025-12-31',
             use_historical_fundamentals=False, macro_data=None,
@@ -134,7 +142,8 @@ class PortfolioBacktester:
             # 执行 trailing stop 卖出
             for ticker, price, reason in tickers_to_sell:
                 pos = positions[ticker]
-                revenue = pos.shares * price - self.config.commission
+                sell_price = self._apply_slippage(price, 'SELL')
+                revenue = pos.shares * sell_price - self.config.commission
                 profit = revenue - pos.cost_basis
                 cash += revenue
 
@@ -306,7 +315,7 @@ class PortfolioBacktester:
             if ticker not in selected_tickers:
                 pos = positions[ticker]
                 if ticker in price_data_dict and date in price_data_dict[ticker].index:
-                    price = price_data_dict[ticker].loc[date, 'Close']
+                    price = self._apply_slippage(price_data_dict[ticker].loc[date, 'Close'], 'SELL')
                 else:
                     price = pos.entry_price
 
@@ -325,7 +334,7 @@ class PortfolioBacktester:
 
         # 卖出旧 SPY 仓位（准备重建）
         if spy_position and date in benchmark_data.index:
-            spy_price = benchmark_data.loc[date, 'Close']
+            spy_price = self._apply_slippage(benchmark_data.loc[date, 'Close'], 'SELL')
             cash += spy_position.shares * spy_price - self.config.commission
             spy_position = None
 
@@ -333,7 +342,7 @@ class PortfolioBacktester:
         # SPY 底仓
         spy_target = total_value * self.config.spy_base_weight * position_multiplier
         if date in benchmark_data.index:
-            spy_price = benchmark_data.loc[date, 'Close']
+            spy_price = self._apply_slippage(benchmark_data.loc[date, 'Close'], 'BUY')
             spy_shares = int(spy_target / spy_price)
             if spy_shares > 0 and cash >= spy_shares * spy_price + self.config.commission:
                 cost = spy_shares * spy_price + self.config.commission
@@ -352,57 +361,60 @@ class PortfolioBacktester:
             if ticker not in price_data_dict or date not in price_data_dict[ticker].index:
                 continue
 
-            price = price_data_dict[ticker].loc[date, 'Close']
+            raw_price = price_data_dict[ticker].loc[date, 'Close']
 
             if ticker in positions:
                 # 已持有：检查是否需要调仓
                 pos = positions[ticker]
-                current_value = pos.shares * price
+                current_value = pos.shares * raw_price
                 diff = target_value - current_value
 
                 if abs(diff) > total_value * 0.02:  # 偏差超过2%才调仓
                     # 卖出旧仓位
-                    revenue = pos.shares * price - self.config.commission
+                    sell_price = self._apply_slippage(raw_price, 'SELL')
+                    revenue = pos.shares * sell_price - self.config.commission
                     profit = revenue - pos.cost_basis
                     cash += revenue
                     trade_log.append({
                         'date': date, 'ticker': ticker, 'action': 'SELL',
-                        'reason': 'REBALANCE_ADJUST', 'shares': pos.shares, 'price': price,
+                        'reason': 'REBALANCE_ADJUST', 'shares': pos.shares, 'price': sell_price,
                         'profit': profit,
-                        'profit_pct': (price - pos.entry_price) / pos.entry_price * 100,
+                        'profit_pct': (sell_price - pos.entry_price) / pos.entry_price * 100,
                         'hold_days': (date - pos.entry_date).days,
                     })
 
                     # 重新买入目标仓位
-                    shares = int(target_value / price)
-                    if shares > 0 and cash >= shares * price + self.config.commission:
-                        cost = shares * price + self.config.commission
+                    buy_price = self._apply_slippage(raw_price, 'BUY')
+                    shares = int(target_value / buy_price)
+                    if shares > 0 and cash >= shares * buy_price + self.config.commission:
+                        cost = shares * buy_price + self.config.commission
                         cash -= cost
                         positions[ticker] = Position(
-                            ticker=ticker, shares=shares, entry_price=price,
-                            entry_date=date, highest_price=price,
+                            ticker=ticker, shares=shares, entry_price=buy_price,
+                            entry_date=date, highest_price=buy_price,
                             combined_score=stock['combined_score'], cost_basis=cost,
                         )
                         trade_log.append({
                             'date': date, 'ticker': ticker, 'action': 'BUY',
-                            'reason': 'REBALANCE_ADJUST', 'shares': shares, 'price': price,
+                            'reason': 'REBALANCE_ADJUST', 'shares': shares, 'price': buy_price,
                             'combined_score': stock['combined_score'],
                         })
                 # 偏差小于2%：不动，节省佣金
             else:
                 # 新建仓
-                shares = int(target_value / price)
-                if shares > 0 and cash >= shares * price + self.config.commission:
-                    cost = shares * price + self.config.commission
+                buy_price = self._apply_slippage(raw_price, 'BUY')
+                shares = int(target_value / buy_price)
+                if shares > 0 and cash >= shares * buy_price + self.config.commission:
+                    cost = shares * buy_price + self.config.commission
                     cash -= cost
                     positions[ticker] = Position(
-                        ticker=ticker, shares=shares, entry_price=price,
-                        entry_date=date, highest_price=price,
+                        ticker=ticker, shares=shares, entry_price=buy_price,
+                        entry_date=date, highest_price=buy_price,
                         combined_score=stock['combined_score'], cost_basis=cost,
                     )
                     trade_log.append({
                         'date': date, 'ticker': ticker, 'action': 'BUY',
-                        'reason': 'REBALANCE_NEW', 'shares': shares, 'price': price,
+                        'reason': 'REBALANCE_NEW', 'shares': shares, 'price': buy_price,
                         'combined_score': stock['combined_score'],
                     })
 
@@ -470,6 +482,17 @@ class PortfolioBacktester:
         avg_portfolio_value = values.mean()
         turnover = total_buy_value / avg_portfolio_value if avg_portfolio_value > 0 else 0
 
+        # Alpha t-stat 和 Information Ratio
+        # daily alpha = portfolio daily return - benchmark daily return
+        daily_alpha = daily_returns - bench_daily_ret.values[:len(daily_returns)] if len(bench_daily_ret) >= len(daily_returns) else daily_returns - 0
+        alpha_mean = np.mean(daily_alpha)
+        alpha_std = np.std(daily_alpha, ddof=1) if len(daily_alpha) > 1 else 1
+        # t-stat = mean(alpha) / (std(alpha) / sqrt(N))
+        alpha_tstat = (alpha_mean / (alpha_std / np.sqrt(len(daily_alpha)))) if alpha_std > 0 else 0
+        # Information Ratio = annualized alpha / tracking error
+        tracking_error = alpha_std * np.sqrt(252)
+        information_ratio = (alpha_mean * 252) / tracking_error if tracking_error > 0 else 0
+
         report = {
             # 收益
             'initial_value': initial,
@@ -488,6 +511,12 @@ class PortfolioBacktester:
             'benchmark_max_dd_pct': round(bench_max_dd * 100, 2),
             'alpha_pct': round((annual_return - bench_annual) * 100, 2),
             'beat_benchmark': total_return > bench_return,
+
+            # Alpha 统计检验
+            'alpha_tstat': round(alpha_tstat, 2),
+            'information_ratio': round(information_ratio, 2),
+            'tracking_error_pct': round(tracking_error * 100, 2),
+            'alpha_significant': abs(alpha_tstat) > 1.96,  # 95% 置信
 
             # 交易
             'total_trades': len(trade_log),

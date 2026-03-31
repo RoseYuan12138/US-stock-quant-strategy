@@ -45,7 +45,8 @@ class PortfolioConfig:
 
     # 回测
     initial_cash: float = 100000         # 初始资金（组合回测用更大的金额）
-    commission: float = 10               # 每笔佣金
+    commission: float = 5                # 每笔佣金
+    slippage_bps: float = 10             # 滑点（基点），10bps = 0.1%
 
 
 @dataclass

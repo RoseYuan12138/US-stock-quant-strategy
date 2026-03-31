@@ -2,13 +2,11 @@
 历史基本面数据模块
 解决前视偏差：用每个时间点已知的财务数据做评分，而不是用当前快照
 
-数据源：yfinance 的季度财报数据（income_stmt, balance_sheet, cashflow）
-限制：yfinance 通常只有最近 4-8 个季度的历史数据，更早的需要其他数据源
+数据源：
+  - yfinance（原始 HistoricalFundamentalFetcher，仅近4-8季度）
+  - FMP parquet（FMPHistoricalFundamentalFetcher，2010-2025，真正的 PIT）
 
-评分逻辑简化版（相比 ValueScreener 的实时版）：
-- 只用可从历史财报推导的指标：PE, 利润率, ROE, 营收增长, 负债率
-- 不用分析师评级/目标价（这些没有可靠的历史数据）
-- 不用 sector PE 中位数（硬编码值不随时间变化没意义）
+评分逻辑：PE, 利润率, ROE, 营收增长, 负债率
 """
 
 import logging
@@ -357,5 +355,157 @@ class HistoricalFundamentalFetcher:
                 score -= 2
             else:
                 score -= 6
+
+        return max(0, min(100, round(score, 1)))
+
+
+class FMPHistoricalFundamentalFetcher:
+    """
+    基于 FMP parquet 数据的历史基本面评分器。
+    接口与 HistoricalFundamentalFetcher 完全兼容。
+
+    优势：
+    - 真正的 Point-in-Time（用 filingDate，不是财报期末）
+    - 覆盖 2010-2025 全历史
+    - 无网络调用，全离线
+    """
+
+    DEFAULT_PARQUET = Path(__file__).parent.parent / "fmp-datasource/cache/fundamentals_merged.parquet"
+
+    def __init__(self, parquet_path=None):
+        path = Path(parquet_path) if parquet_path else self.DEFAULT_PARQUET
+        if not path.exists():
+            raise FileNotFoundError(f"FMP fundamentals parquet not found: {path}")
+        df = pd.read_parquet(path)
+        df["filingDate"] = pd.to_datetime(df["filingDate"], errors="coerce")
+        df = df.dropna(subset=["filingDate", "symbol"])
+        df = df.sort_values(["symbol", "filingDate"]).reset_index(drop=True)
+        self._df = df
+        self._ticker_cache = {}
+
+    def _get_ticker_df(self, ticker):
+        ticker = ticker.upper()
+        if ticker not in self._ticker_cache:
+            self._ticker_cache[ticker] = self._df[self._df["symbol"] == ticker].copy()
+        return self._ticker_cache[ticker]
+
+    def get_score_at_date(self, ticker, target_date):
+        """
+        返回截至 target_date 最新已申报数据的评分，格式与原类一致。
+        """
+        tdf = self._get_ticker_df(ticker)
+        if tdf.empty:
+            return None
+
+        target_ts = pd.Timestamp(target_date)
+        available = tdf[tdf["filingDate"] <= target_ts]
+        if available.empty:
+            return None
+
+        row = available.iloc[-1]
+        metrics = self._compute_metrics(row, tdf, available)
+        score = self._score_from_metrics(metrics)
+        return {
+            "quarter_end": str(row.get("date", ""))[:10],
+            "available_date": str(row["filingDate"].date()),
+            "score": score,
+            "metrics": metrics,
+        }
+
+    def get_scores_timeseries(self, ticker):
+        tdf = self._get_ticker_df(ticker)
+        results = []
+        for i in range(len(tdf)):
+            row = tdf.iloc[i]
+            available_so_far = tdf.iloc[: i + 1]
+            metrics = self._compute_metrics(row, tdf, available_so_far)
+            score = self._score_from_metrics(metrics)
+            results.append({
+                "quarter_end": str(row.get("date", ""))[:10],
+                "available_date": str(row["filingDate"].date()),
+                "score": score,
+                "metrics": metrics,
+            })
+        return results
+
+    def load_ticker(self, ticker):
+        """兼容原类接口，预热缓存用。"""
+        self._get_ticker_df(ticker)
+        return True
+
+    def _safe(self, row, col):
+        v = row.get(col)
+        if v is None:
+            return None
+        try:
+            f = float(v)
+            return f if pd.notna(f) and f != 0 else None
+        except Exception:
+            return None
+
+    def _compute_metrics(self, row, full_tdf, available_tdf):
+        revenue = self._safe(row, "revenue")
+        net_income = self._safe(row, "netIncome")
+        operating_income = self._safe(row, "operatingIncome")
+        total_equity = self._safe(row, "totalEquity") or self._safe(row, "totalStockholdersEquity")
+        total_debt = self._safe(row, "totalDebt")
+
+        profit_margin = (net_income / revenue) if revenue and net_income is not None else None
+        operating_margin = (operating_income / revenue) if revenue and operating_income is not None else None
+        roe = ((net_income * 4) / total_equity) if total_equity and net_income is not None else None
+        debt_to_equity = (total_debt / total_equity * 100) if total_equity and total_debt is not None else None
+
+        # YoY 营收增长：和4行前比（约1年）
+        revenue_growth = None
+        idx = available_tdf.index.get_loc(row.name) if row.name in available_tdf.index else -1
+        if idx >= 4:
+            prev_rev = self._safe(available_tdf.iloc[idx - 4], "revenue")
+            if prev_rev and prev_rev > 0 and revenue:
+                revenue_growth = (revenue - prev_rev) / prev_rev
+
+        return {
+            "pe": None,  # 无价格数据，跳过
+            "profit_margin": profit_margin,
+            "operating_margin": operating_margin,
+            "roe": roe,
+            "debt_to_equity": debt_to_equity,
+            "revenue_growth": revenue_growth,
+            "revenue": revenue,
+            "net_income": net_income,
+        }
+
+    def _score_from_metrics(self, m):
+        score = 50
+
+        margin = m.get("profit_margin")
+        if margin is not None:
+            if margin > 0.25:   score += 10
+            elif margin > 0.15: score += 6
+            elif margin > 0.05: score += 2
+            elif margin > 0:    score -= 2
+            else:               score -= 8
+
+        roe = m.get("roe")
+        if roe is not None:
+            if roe > 0.25:   score += 10
+            elif roe > 0.15: score += 6
+            elif roe > 0.08: score += 2
+            elif roe > 0:    score -= 2
+            else:            score -= 8
+
+        rev_growth = m.get("revenue_growth")
+        if rev_growth is not None:
+            if rev_growth > 0.25:   score += 12
+            elif rev_growth > 0.10: score += 7
+            elif rev_growth > 0:    score += 2
+            elif rev_growth > -0.10: score -= 3
+            else:                   score -= 10
+
+        dte = m.get("debt_to_equity")
+        if dte is not None:
+            if dte < 30:    score += 6
+            elif dte < 80:  score += 2
+            elif dte < 150: score -= 2
+            else:           score -= 6
 
         return max(0, min(100, round(score, 1)))

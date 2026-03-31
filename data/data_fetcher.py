@@ -1,6 +1,7 @@
 """
 美股数据获取模块
-使用 yfinance 获取历史 OHLCV 数据，支持批量下载和本地缓存
+优先读取 FMP parquet 本地文件，回退到 yfinance
+支持批量下载和本地缓存
 """
 
 import os
@@ -10,6 +11,22 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import pandas as pd
 import yfinance as yf
+
+
+def _find_fmp_cache() -> Path:
+    """查找 FMP 缓存目录（优先环境变量，然后从 __file__ 向上搜索）"""
+    if 'FMP_CACHE_DIR' in os.environ:
+        return Path(os.environ['FMP_CACHE_DIR'])
+    p = Path(__file__).resolve().parent
+    for _ in range(10):
+        candidate = p / 'fmp-datasource' / 'cache'
+        if candidate.exists():
+            return candidate
+        p = p.parent
+    return Path('fmp-datasource/cache')
+
+
+_FMP_CACHE = _find_fmp_cache()
 
 # 配置日志
 logging.basicConfig(
@@ -73,14 +90,20 @@ class DataFetcher:
             # 默认获取最近 2 年
             start_date = (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d')
         
-        # 尝试从缓存加载
+        # 优先从 FMP parquet 加载
+        if not force_update:
+            fmp_data = self._load_from_fmp(ticker, start_date, end_date)
+            if fmp_data is not None:
+                return fmp_data
+
+        # 尝试从缓存加载（yfinance 缓存）
         if use_cache and not force_update:
             cached_data = self._load_from_cache(ticker)
             if cached_data is not None and len(cached_data) > 50:  # 必须有足够的历史数据
                 # 检查缓存是否需要更新（是否包含今天的数据）
                 last_cached_date = cached_data.index[-1].strftime('%Y-%m-%d')
                 today = datetime.now().strftime('%Y-%m-%d')
-                
+
                 if last_cached_date == today:
                     logger.info(f"{ticker}: 使用缓存数据 (最后更新: {last_cached_date})")
                     return cached_data
@@ -88,7 +111,7 @@ class DataFetcher:
                     # 缓存数据足够，直接返回
                     logger.info(f"{ticker}: 使用缓存数据，最后更新 {last_cached_date}")
                     return cached_data
-        
+
         # 从 yfinance 获取数据
         try:
             logger.info(f"{ticker}: 从 {start_date} 到 {end_date} 下载数据...")
@@ -180,6 +203,34 @@ class DataFetcher:
             logger.error(f"{ticker}: 缓存加载失败 - {str(e)}")
             return None
     
+    def _load_from_fmp(self, ticker, start_date=None, end_date=None):
+        """从 FMP parquet 加载价格数据"""
+        parquet_file = _FMP_CACHE / 'prices' / f'{ticker}.parquet'
+        if not parquet_file.exists():
+            return None
+        try:
+            df = pd.read_parquet(parquet_file)
+            df['date'] = pd.to_datetime(df['date'])
+            df = df.sort_values('date').set_index('date')
+            df.index.name = 'Date'
+            df = df.rename(columns={
+                'open': 'Open', 'high': 'High', 'low': 'Low',
+                'close': 'Close', 'volume': 'Volume',
+            })
+            df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
+            if start_date:
+                df = df[df.index >= pd.Timestamp(start_date)]
+            if end_date:
+                df = df[df.index <= pd.Timestamp(end_date)]
+            df = df.dropna()
+            if len(df) == 0:
+                return None
+            logger.info(f"{ticker}: 从 FMP parquet 加载 {len(df)} 行数据")
+            return df
+        except Exception as e:
+            logger.warning(f"{ticker}: FMP parquet 加载失败 - {e}")
+            return None
+
     def clear_cache(self, ticker=None):
         """清除缓存"""
         if ticker:

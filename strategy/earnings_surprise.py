@@ -7,16 +7,33 @@ Earnings Surprise 因子（盈利惊喜）
 - 财报超预期后，股价在 60-90 天内持续漂移（市场对盈利信息反应不足）
 - 这是金融学中最持久的异象之一，发现 30+ 年仍然有效
 
-数据源：yfinance Ticker.earnings_dates 或 quarterly_earnings
+数据源：优先读取 FMP parquet 本地文件，回退到 yfinance
 """
 
 import logging
+import os
 import numpy as np
 import pandas as pd
 import yfinance as yf
 from pathlib import Path
 from datetime import datetime, timedelta
 import json
+
+
+def _find_fmp_cache() -> Path:
+    """查找 FMP 缓存目录（优先环境变量，然后从 __file__ 向上搜索）"""
+    if 'FMP_CACHE_DIR' in os.environ:
+        return Path(os.environ['FMP_CACHE_DIR'])
+    p = Path(__file__).resolve().parent
+    for _ in range(10):
+        candidate = p / 'fmp-datasource' / 'cache'
+        if candidate.exists():
+            return candidate
+        p = p.parent
+    return Path('fmp-datasource/cache')
+
+
+_FMP_CACHE = _find_fmp_cache()
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +71,13 @@ class EarningsSurpriseScorer:
         if ticker in self._cache:
             return self._cache[ticker]
 
-        # 磁盘缓存
+        # 优先从 FMP parquet 加载
+        fmp_earnings = self._load_from_fmp(ticker)
+        if fmp_earnings is not None:
+            self._cache[ticker] = fmp_earnings
+            return fmp_earnings
+
+        # 磁盘缓存（yfinance 来源）
         cache_file = self.cache_dir / f"{ticker}.json"
         if cache_file.exists():
             try:
@@ -68,7 +91,7 @@ class EarningsSurpriseScorer:
             except Exception:
                 pass
 
-        # 从 yfinance 获取
+        # 从 yfinance 获取（回退）
         earnings = self._fetch_earnings(ticker)
         self._cache[ticker] = earnings
 
@@ -204,6 +227,36 @@ class EarningsSurpriseScorer:
         for ticker in tickers:
             results[ticker] = self.score_at_date(ticker, target_date)
         return results
+
+    def _load_from_fmp(self, ticker):
+        """从 FMP parquet 加载 earnings 数据"""
+        parquet_file = _FMP_CACHE / 'earnings' / f'{ticker}.parquet'
+        if not parquet_file.exists():
+            return None
+        try:
+            df = pd.read_parquet(parquet_file)
+            results = []
+            for _, row in df.iterrows():
+                actual = row.get('epsActual')
+                estimate = row.get('epsEstimated')
+                date = row.get('date')
+                if pd.notna(actual) and pd.notna(estimate) and estimate != 0 and date:
+                    surprise_pct = (actual - estimate) / abs(estimate) * 100
+                    results.append({
+                        'date': str(pd.Timestamp(date).date()),
+                        'eps_actual': float(actual),
+                        'eps_estimate': float(estimate),
+                        'surprise_pct': round(float(surprise_pct), 2),
+                        'beat': bool(actual > estimate),
+                    })
+            results.sort(key=lambda x: x['date'], reverse=True)
+            if not results:
+                return None
+            logger.info(f"{ticker}: 从 FMP parquet 加载 {len(results)} 条 earnings 数据")
+            return results
+        except Exception as e:
+            logger.warning(f"{ticker}: FMP earnings parquet 加载失败 - {e}")
+            return None
 
     def _fetch_earnings(self, ticker):
         """从 yfinance 获取 earnings data"""
