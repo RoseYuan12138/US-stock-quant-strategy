@@ -322,8 +322,21 @@ class Backtester:
         if "SPY" not in tickers:
             tickers.append("SPY")
 
+        # Always load essential ETFs for market regime detection, even if not
+        # in S&P 500 or missing fundamentals.
+        ESSENTIAL_ETFS = [
+            "QQQ", "IWM",
+            # Leading/speculative ETFs (MarketTopDetector)
+            "ARKK", "SOXX", "SMH", "IGV", "XBI",
+            # Sector ETFs (defensive rotation signals)
+            "XLK", "XLF", "XLE", "XLV", "XLP", "XLU", "XLY", "XLC", "XLI", "XLB",
+        ]
+        for etf in ESSENTIAL_ETFS:
+            if etf not in tickers:
+                tickers.append(etf)
+
         print(f"  Universe: {len(tickers)} tickers (from {len(pit_tickers)} "
-              f"PIT members, filtered by FMP data)")
+              f"PIT members, filtered by FMP data, +{len(ESSENTIAL_ETFS)} ETFs)")
         return tickers
 
     def _load_prices(self, tickers: List[str],

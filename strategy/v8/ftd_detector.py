@@ -2,6 +2,14 @@
 
 State machine: NO_SIGNAL → CORRECTION → RALLY_ATTEMPT → FTD_CONFIRMED
 Solves the "when to get back in after a sell-off" problem.
+
+Key fixes vs original:
+- Quality decay computed from _initial_quality (not compound per day)
+- Post-FTD dist-day threshold raised from -0.2% to -0.5% (less hair-trigger)
+- Post-FTD invalidation count raised from 4 to 8
+- Correction threshold raised from -7% to -10%
+- NO_SIGNAL exposure raised to 0.95
+- When SPY makes new 20-day high in FTD_CONFIRMED, refresh quality to keep invested
 """
 
 import numpy as np
@@ -20,12 +28,13 @@ class FTDDetector:
     FTD_INVALIDATED = "FTD_INVALIDATED"
 
     # Parameters
-    CORRECTION_THRESHOLD = -0.07  # 7% decline triggers correction
-    CORRECTION_MIN_DAYS = 3       # Minimum down days
-    FTD_MIN_GAIN = 0.0125        # 1.25% gain on FTD day
+    CORRECTION_THRESHOLD = -0.10  # 10% decline triggers correction
+    FTD_MIN_GAIN = 0.0125         # 1.25% gain on FTD day
     FTD_WINDOW_START = 4          # FTD can happen day 4+
     FTD_WINDOW_END = 10           # through day 10
-    INVALIDATION_DAYS = 25        # Distribution days tracked post-FTD
+    POST_FTD_DIST_THRESHOLD = -0.005   # -0.5% to count as distribution (was -0.2%)
+    POST_FTD_INVALIDATION_COUNT = 8    # 8 dist days to invalidate (was 4)
+    QUALITY_DECAY_DAYS = 120      # Decay half-life in days (from initial, not compound)
 
     def __init__(self):
         self.state = self.NO_SIGNAL
@@ -36,7 +45,8 @@ class FTDDetector:
         self._ftd_date = None
         self._ftd_low = None
         self._post_ftd_dist_count = 0
-        self._quality_score = 0
+        self._initial_quality_score = 0  # Quality at FTD confirmation (fixed)
+        self._quality_score = 0          # Decayed quality (computed each step)
 
     def update(self, date: pd.Timestamp, price_data: dict) -> dict:
         """Update FTD state machine with new daily data.
@@ -46,7 +56,7 @@ class FTDDetector:
                 "state": str,
                 "quality_score": float (0-100),
                 "exposure_guidance": float (0-1),
-                "days_in_state": int,
+                "rally_day_count": int,
             }
         """
         spy = price_data.get("SPY")
@@ -79,14 +89,15 @@ class FTDDetector:
             avg_vol = float(vol.iloc[-60:].mean())
             vol_above_avg = float(vol.iloc[-1]) > avg_vol
 
-        # Track swing high
+        # Track swing high (20-day high for trend strength check)
         recent_high = float(close.iloc[-20:].max()) if len(close) >= 20 else current
         if self._swing_high is None or recent_high > self._swing_high:
             self._swing_high = recent_high
 
-        # State machine transitions
+        # --- State machine transitions ---
+
         if self.state == self.NO_SIGNAL:
-            # Check if we've entered a correction
+            # Enter correction only when 10%+ below recent swing high
             if self._swing_high and current < self._swing_high * (1 + self.CORRECTION_THRESHOLD):
                 self.state = self.CORRECTION
                 self._swing_low = current
@@ -97,7 +108,7 @@ class FTDDetector:
             if current < (self._swing_low or current):
                 self._swing_low = current
 
-            # Check for first up day (rally attempt begins)
+            # First up day starts rally attempt
             if daily_return > 0:
                 self._rally_day_count += 1
                 if self._rally_day_count == 1:
@@ -115,8 +126,7 @@ class FTDDetector:
                 self._swing_low = current
                 self._rally_day_count = 0
                 self._rally_start_date = None
-
-            # Enter FTD window
+            # Enter FTD window on day 4+
             elif self._rally_day_count >= self.FTD_WINDOW_START:
                 self.state = self.FTD_WINDOW
 
@@ -124,68 +134,79 @@ class FTDDetector:
             self._rally_day_count += 1
 
             # Check for FTD qualification
-            if (daily_return >= self.FTD_MIN_GAIN and
-                    vol_above_avg and
+            if (daily_return >= self.FTD_MIN_GAIN and vol_above_avg and
                     self._rally_day_count <= self.FTD_WINDOW_END):
-                self.state = self.FTD_CONFIRMED
-                self._ftd_date = date
-                self._ftd_low = self._swing_low
-                self._post_ftd_dist_count = 0
-                self._quality_score = self._compute_quality(
-                    daily_return, volume_higher, spy_up_to, qqq, date)
+                self._confirm_ftd(date, daily_return, volume_higher, spy_up_to, qqq)
 
-            # Window expired without FTD
+            # Late FTD (after window) still counts at reduced quality
             elif self._rally_day_count > self.FTD_WINDOW_END:
-                # Check if broke below swing low
                 if self._swing_low and current < self._swing_low:
                     self.state = self.CORRECTION
                     self._swing_low = current
                     self._rally_day_count = 0
-                else:
-                    # Keep monitoring but weaker signal
-                    # Late FTDs still count but lower quality
-                    if daily_return >= self.FTD_MIN_GAIN and vol_above_avg:
-                        self.state = self.FTD_CONFIRMED
-                        self._ftd_date = date
-                        self._ftd_low = self._swing_low
-                        self._post_ftd_dist_count = 0
-                        self._quality_score = self._compute_quality(
-                            daily_return, volume_higher, spy_up_to, qqq, date) * 0.7
+                elif daily_return >= self.FTD_MIN_GAIN and vol_above_avg:
+                    self._confirm_ftd(date, daily_return, volume_higher,
+                                      spy_up_to, qqq, late=True)
 
             # Rally failed
-            if self._swing_low and current < self._swing_low:
+            if self.state == self.FTD_WINDOW and self._swing_low and current < self._swing_low:
                 self.state = self.CORRECTION
                 self._swing_low = current
                 self._rally_day_count = 0
 
         elif self.state == self.FTD_CONFIRMED:
-            # Monitor for invalidation
-            # Count distribution days post-FTD
-            if daily_return <= -0.002 and volume_higher:
+            # Compute non-compounding quality decay from initial score
+            if self._ftd_date:
+                days_since = (date - self._ftd_date).days
+                # Linear decay from initial, minimum 40% of original
+                decay = max(0.40, 1.0 - days_since / self.QUALITY_DECAY_DAYS)
+                self._quality_score = self._initial_quality_score * decay
+
+            # Count post-FTD distribution days (stricter -0.5% threshold)
+            if daily_return <= self.POST_FTD_DIST_THRESHOLD and volume_higher:
                 self._post_ftd_dist_count += 1
 
-            # Invalidation: broke below FTD day low or too many dist days
+            # Refresh: if market breaks to new highs, reset the FTD clock
+            if len(close) >= 60:
+                high_60 = float(close.iloc[-60:].max())
+                if current >= high_60 * 0.99:
+                    # New 60-day high — market confirmed healthy, extend FTD
+                    self._ftd_date = date
+                    self._initial_quality_score = max(
+                        self._initial_quality_score, 70.0)
+                    self._quality_score = self._initial_quality_score
+                    self._post_ftd_dist_count = 0
+
+            # Invalidation: broke below FTD day low OR too many dist days
             if self._ftd_low and current < self._ftd_low:
                 self.state = self.FTD_INVALIDATED
                 self._quality_score = 0
-            elif self._post_ftd_dist_count >= 4:
+            elif self._post_ftd_dist_count >= self.POST_FTD_INVALIDATION_COUNT:
                 self.state = self.FTD_INVALIDATED
                 self._quality_score = 0
 
-            # Gradual quality decay
-            if self._ftd_date:
-                days_since = (date - self._ftd_date).days
-                decay = max(0, 1 - days_since / 60)  # Decay over 60 days
-                self._quality_score *= decay
-
         elif self.state == self.FTD_INVALIDATED:
-            # Reset to look for next correction
+            # Reset to look for next pattern
             self.state = self.NO_SIGNAL
             self._swing_high = current
             self._swing_low = None
             self._rally_day_count = 0
+            self._post_ftd_dist_count = 0
 
         return self._result()
+
+    def _confirm_ftd(self, date, ftd_gain, vol_higher, spy_df, qqq_data,
+                     late=False):
+        """Transition to FTD_CONFIRMED state."""
+        self.state = self.FTD_CONFIRMED
+        self._ftd_date = date
+        self._ftd_low = self._swing_low
+        self._post_ftd_dist_count = 0
+        quality = self._compute_quality(ftd_gain, vol_higher, spy_df, qqq_data, date)
+        if late:
+            quality *= 0.70
+        self._initial_quality_score = quality
+        self._quality_score = quality
 
     def _compute_quality(self, ftd_gain: float, vol_higher: bool,
                          spy_df: pd.DataFrame, qqq_data, date) -> float:
@@ -214,7 +235,8 @@ class FTDDetector:
         if qqq_data is not None:
             qqq_up_to = qqq_data[qqq_data.index <= date]
             if len(qqq_up_to) >= 2:
-                qqq_ret = float(qqq_up_to["Close"].iloc[-1]) / float(qqq_up_to["Close"].iloc[-2]) - 1
+                qqq_ret = (float(qqq_up_to["Close"].iloc[-1]) /
+                           float(qqq_up_to["Close"].iloc[-2]) - 1)
                 if qqq_ret >= 0.01:
                     score += 10  # Dual-index confirmation
 
@@ -222,24 +244,23 @@ class FTDDetector:
 
     def _result(self) -> dict:
         """Build result dict."""
-        # Exposure guidance based on state
         if self.state == self.FTD_CONFIRMED:
             if self._quality_score >= 80:
                 exposure = 0.90
             elif self._quality_score >= 60:
-                exposure = 0.70
+                exposure = 0.80
             elif self._quality_score >= 40:
-                exposure = 0.50
+                exposure = 0.70
             else:
-                exposure = 0.35
-        elif self.state in (self.NO_SIGNAL,):
-            exposure = 0.80  # Default: normal conditions
+                exposure = 0.65  # Still mostly invested even at low quality
+        elif self.state == self.NO_SIGNAL:
+            exposure = 0.95  # Fully invested in normal conditions
         elif self.state == self.CORRECTION:
             exposure = 0.30  # In correction: defensive
         elif self.state in (self.RALLY_ATTEMPT, self.FTD_WINDOW):
-            exposure = 0.40  # Waiting for confirmation
+            exposure = 0.45  # Waiting for confirmation (raised from 0.40)
         else:  # INVALIDATED
-            exposure = 0.25
+            exposure = 0.35
 
         return {
             "state": self.state,

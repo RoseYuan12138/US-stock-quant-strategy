@@ -30,7 +30,7 @@ class V8Config:
     rebalance_days: int = 14           # bi-weekly
     slippage_bps: float = 10.0         # one-way slippage in bps
     commission: float = 0.0            # per-trade commission ($)
-    trailing_stop_pct: float = 0.15    # 15% trailing stop (tighter than V7)
+    trailing_stop_pct: float = 0.25    # 25% trailing stop (was 15%; looser to reduce adverse churn)
 
     # ATR position sizing
     risk_per_trade: float = 0.01       # 1% risk per trade

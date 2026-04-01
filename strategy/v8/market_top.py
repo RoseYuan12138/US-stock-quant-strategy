@@ -92,15 +92,19 @@ class MarketTopDetector:
         else:
             zone = "critical"
 
-        # Exposure ceiling based on risk
+        # Exposure ceiling based on risk.
+        # Smooth gradient — avoids the 0.65→0.45 cliff that traps post-crash
+        # recoveries in DEFENSIVE even when FTD is confirmed.
         if top_risk <= 20:
             ceiling = 1.0
         elif top_risk <= 40:
             ceiling = 0.85
-        elif top_risk <= 60:
-            ceiling = 0.65
-        elif top_risk <= 80:
-            ceiling = 0.45
+        elif top_risk <= 55:
+            ceiling = 0.75
+        elif top_risk <= 70:
+            ceiling = 0.60
+        elif top_risk <= 85:
+            ceiling = 0.40
         else:
             ceiling = 0.25
 
@@ -211,16 +215,21 @@ class MarketTopDetector:
         # Check for lower highs (bearish structure)
         risk = 0
 
+        ret_20d = current / float(close.iloc[-20]) - 1 if len(close) >= 20 else 0
+
         if current < sma_200:
             risk += 40
         elif current < sma_50:
             risk += 20
 
+        # Death cross — lagging indicator; discount when market is already bouncing
         if sma_50 < sma_200:
-            risk += 30  # Death cross
+            if ret_20d > 0.03:
+                risk += 10  # Recovering fast: discount the death cross signal
+            else:
+                risk += 25  # Normal death cross penalty (reduced from 30)
 
         # Recent momentum
-        ret_20d = current / float(close.iloc[-20]) - 1 if len(close) >= 20 else 0
         if ret_20d < -0.05:
             risk += 20
         elif ret_20d < -0.02:

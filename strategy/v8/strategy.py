@@ -30,11 +30,36 @@ class V8Strategy(StrategyBase):
 
     name = "V8 Druckenmiller Attack/Defense"
 
-    # Factors to keep from V7 (stable IC across regimes)
+    # Factors with consistent positive IC across regimes.
+    # Momentum dominates; analyst_revision and SUE add small edge.
     KEEP_FACTORS = [
-        "analyst_revision_z", "sue_z", "accruals_z",
-        "mom_6m_z", "mom_12m_skip1_z",
+        "mom_12m_skip1_z",     # Strongest IC: +0.007-0.015 across regimes
+        "mom_6m_z",            # Good momentum signal
+        "mom_1m_rev_z",        # Best IC in bull (+0.021); short-term reversal adds edge
+        "analyst_revision_z",  # Consistent: -0.006 bull but +0.025/+0.026 crash/bear
+        "sue_z",               # Small but positive
+        "accruals_z",          # Quality screen
     ]
+
+    # Static factor weights — same for all regimes.
+    # Lesson from rounds 6-8: regime-specific weights hurt more than they help.
+    # analyst_revision_z is forward-looking and works in ALL regimes:
+    # - 2022 bear: energy analysts upgrading → selects energy correctly
+    # - 2023 recovery: tech analysts upgrading → selects NVDA/META correctly
+    # Concentrated single-dominant-factor approach beats balanced portfolio of factors.
+    FACTOR_WEIGHTS = {
+        "analyst_revision_z": 0.35,
+        "mom_6m_z": 0.20,
+        "mom_12m_skip1_z": 0.20,
+        "mom_1m_rev_z": 0.10,
+        "sue_z": 0.10,
+        "accruals_z": 0.05,
+    }
+
+    # Regime aliases (all same — preserve interface compatibility)
+    BULL_WEIGHTS = FACTOR_WEIGHTS
+    BEAR_WEIGHTS = FACTOR_WEIGHTS
+    CAUTION_WEIGHTS = FACTOR_WEIGHTS
 
     def __init__(self, config):
         self.config = config
@@ -46,10 +71,9 @@ class V8Strategy(StrategyBase):
         self.ftd_detector = FTDDetector()
         self.exposure_coach = ExposureCoach()
         self.position_sizer = ATRPositionSizer(
-            risk_pct=0.01,
-            atr_multiplier=2.0,
-            max_single_pct=0.10,
-            max_sector_pct=0.30,
+            max_single_pct=0.07,
+            max_sector_pct=0.25,  # Tighter sector cap (was 30%) to avoid single-sector concentration
+            target_n=20,
         )
         self.vcp_screener = VCPScreener()
         self.pead_screener = PEADScreener()
@@ -86,33 +110,94 @@ class V8Strategy(StrategyBase):
             s: c / total for s, c in sectors.items()
         }
 
+    def _compute_trend_exposure(self, date: pd.Timestamp) -> tuple:
+        """Trend-following exposure based on SPY moving averages + recovery signal.
+
+        Primary signal: SPY vs 200/50/20 DMA stack.
+        Recovery boost: when 50DMA is rising and SPY has bounced from bear low,
+        add up to +0.15 exposure to avoid being stuck in BEAR during early recovery.
+        This specifically targets the Oct 2022 → Apr 2023 bottoming/recovery sequence
+        where pure 200DMA crossover is too lagging.
+
+        Returns (max_exposure, regime_label).
+        """
+        spy = self._price_data.get("SPY")
+        if spy is None:
+            return 0.70, "CAUTION"
+
+        spy_up = spy[spy.index <= date]
+        if len(spy_up) < 200:
+            return 0.70, "CAUTION"
+
+        close = spy_up["Close"]
+        current = float(close.iloc[-1])
+        sma_200 = float(close.iloc[-200:].mean())
+        sma_50 = float(close.iloc[-50:].mean())
+        sma_20 = float(close.iloc[-20:].mean()) if len(close) >= 20 else sma_50
+
+        # Trend alignment: all MAs stacked bullishly
+        if current > sma_20 and sma_20 > sma_50 and sma_50 > sma_200:
+            return 0.95, "BULL"         # Perfect bull alignment
+        elif current > sma_50 and sma_50 > sma_200:
+            return 0.85, "BULL"         # Good uptrend
+        elif current > sma_200:
+            return 0.70, "CAUTION"      # Above 200DMA but choppy
+
+        # Below 200DMA — check recovery signal before assigning bear exposure
+        # Recovery signal: 50DMA is rising (short-term trend turning up) AND
+        # SPY has bounced ≥10% from recent 52-week low (confirmed liftoff)
+        low_52w = float(close.iloc[-252:].min()) if len(close) >= 252 else float(close.min())
+        bounce_pct = (current / low_52w - 1)
+
+        # 50DMA direction: compare recent 50DMA to 20 trading days ago
+        sma_50_prior = float(close.iloc[-70:-20].mean()) if len(close) >= 70 else sma_50
+        sma_50_rising = sma_50 > sma_50_prior
+
+        if current > sma_200 * 0.93:
+            # Just below 200DMA (-7%): DEFENSIVE base
+            if sma_50_rising and bounce_pct >= 0.10:
+                return 0.65, "DEFENSIVE"   # Recovery in progress: boost from 0.50
+            return 0.50, "DEFENSIVE"
+        elif current > sma_200 * 0.85:
+            # Clearly below 200DMA (-15% to -7%): BEAR base
+            if sma_50_rising and bounce_pct >= 0.12:
+                return 0.45, "DEFENSIVE"   # Bear recovery: upgrade to DEFENSIVE
+            return 0.30, "BEAR"
+        else:
+            # Deep bear (>-15% below 200DMA)
+            if sma_50_rising and bounce_pct >= 0.15:
+                return 0.35, "BEAR"        # Deep bear recovery: modest boost
+            return 0.15, "BEAR"
+
     def on_rebalance(self, date: pd.Timestamp, universe: list,
                      prev_date: pd.Timestamp = None,
                      prev_factors: pd.DataFrame = None
                      ) -> Tuple[Dict[str, float], pd.DataFrame]:
         """V8 rebalance: defense check → offense check → stock selection → sizing."""
 
-        # --- PHASE 1: DEFENSE ASSESSMENT ---
+        # --- EXPOSURE DECISION (trend-following primary signal) ---
+        max_exposure, regime = self._compute_trend_exposure(date)
+
+        # Secondary: MarketTopDetector adjusts exposure at extremes
+        # (keep for breadth/leading-stock context, but don't let it override trend)
         macro = self._data_loader.get_macro_at(date)
         top_result = self.top_detector.assess(
             date, universe, self._price_data, macro)
+        top_risk = top_result.get("top_risk", 0)
 
-        # --- PHASE 2: OFFENSE ASSESSMENT ---
-        ftd_result = self.ftd_detector.update(date, self._price_data)
+        # Only apply top_risk reduction at very high readings to avoid
+        # double-penalizing post-crash recovery periods
+        if top_risk >= 85:
+            max_exposure = min(max_exposure, 0.35)
+            regime = "BEAR"
+        elif top_risk >= 72:
+            max_exposure = min(max_exposure, max_exposure * 0.80)
 
-        # --- EXPOSURE DECISION ---
-        exposure = self.exposure_coach.recommend(top_result, ftd_result)
-        self._current_regime = exposure["regime"]
-        self._current_exposure = exposure["max_exposure"]
+        self._current_regime = regime
+        self._current_exposure = max_exposure
 
         self._diagnostics["regime_history"].append(
             (str(date), self._current_regime, self._current_exposure))
-        self._diagnostics["exposure_history"].append(
-            (str(date), exposure))
-
-        # If CASH_PRIORITY, use minimal exposure (not zero — avoid missing recoveries)
-        if exposure["action"] == "CASH_PRIORITY":
-            self._current_exposure = max(self._current_exposure, 0.15)
 
         # --- PHASE 3: STOCK SELECTION ---
         # A) Compute V7 factors (refined subset)
@@ -126,39 +211,37 @@ class V8Strategy(StrategyBase):
             if fwd_returns:
                 self.ic_tracker.record_ic(date, prev_factors, fwd_returns)
 
-        # IC-weighted composite (only keep stable factors)
-        ic_weights = self.ic_tracker.get_ic_weights()
-        # Zero out factors we don't trust
-        filtered_weights = {}
-        for k, v in ic_weights.items():
-            if k in self.KEEP_FACTORS:
-                filtered_weights[k] = v
-            else:
-                filtered_weights[k] = 0.0
+        # Regime-specific factor weights based on IC evidence
+        if regime == "BULL":
+            weights = self.BULL_WEIGHTS
+        elif regime in ("BEAR", "DEFENSIVE"):
+            weights = self.BEAR_WEIGHTS
+        else:  # CAUTION
+            weights = self.CAUTION_WEIGHTS
 
         if factors_df is not None and not factors_df.empty:
             factors_df = self.factor_engine.compute_composite_score(
-                factors_df, filtered_weights)
+                factors_df, weights)
 
         # B) VCP screening
         spy_df = self._price_data.get("SPY")
         vcp_candidates = self.vcp_screener.screen(
             date, universe, self._price_data, spy_df)
-        vcp_symbols = {c["symbol"]: c["vcp_score"] for c in vcp_candidates[:30]}
+        vcp_symbols = {c["symbol"]: c["vcp_score"] for c in vcp_candidates[:50]}
 
         # C) PEAD screening
         pead_candidates = self.pead_screener.screen(
             date, universe, self._price_data,
             self._data_loader._earnings)
-        pead_symbols = {c["symbol"]: c["pead_score"] for c in pead_candidates[:20]}
+        pead_symbols = {c["symbol"]: c["pead_score"] for c in pead_candidates[:40]}
 
         # --- COMBINE SIGNALS ---
         # Build candidate list with multi-signal scoring
+        sector_map = {sym: self._data_loader.get_sector(sym) for sym in universe}
         candidates = self._combine_signals(
-            factors_df, vcp_symbols, pead_symbols, universe)
+            factors_df, vcp_symbols, pead_symbols, universe, regime, sector_map)
 
         # --- PHASE 4: POSITION SIZING ---
-        sector_map = {sym: self._data_loader.get_sector(sym) for sym in universe}
 
         target = self.position_sizer.size_portfolio(
             candidates=candidates,
@@ -171,15 +254,25 @@ class V8Strategy(StrategyBase):
 
         return target, factors_df if factors_df is not None else pd.DataFrame()
 
+    # Sector classification for regime-aware selection
+    DEFENSIVE_SECTORS = {"Healthcare", "Consumer Staples", "Utilities"}
+    CYCLICAL_SECTORS = {"Energy", "Materials", "Consumer Discretionary"}
+
     def _combine_signals(self, factors_df: pd.DataFrame,
                          vcp_symbols: dict, pead_symbols: dict,
-                         universe: list) -> list:
+                         universe: list,
+                         regime: str = "BULL",
+                         sector_map: dict = None) -> list:
         """Combine factor scores, VCP, and PEAD into ranked candidates.
 
         Weights:
             Factor composite z-score: 40%
             VCP score: 35%
             PEAD score: 25%
+
+        In BEAR/DEFENSIVE: defensive sectors get +15% boost; cyclicals get -20% penalty.
+        This prevents momentum factors from locking into 2022 energy winners
+        right as the market transitions to a tech-led recovery.
         """
         scores = {}
 
@@ -228,6 +321,12 @@ class V8Strategy(StrategyBase):
                 composite *= 1.15  # 15% bonus for multi-signal
             if signals_active >= 3:
                 composite *= 1.10  # Additional 10% for triple agreement
+
+            # No sector bias — let factor weights drive selection.
+            # Sector penalties backfire: energy was the 2022 top sector (+60%)
+            # despite BEAR regime. fcf_yield_z/roe_z naturally select energy
+            # in 2022 (high oil FCF). Regime rotation in 2023 handled by
+            # CAUTION_WEIGHTS which boost analyst_revision_z and mom_1m_rev_z.
 
             candidates.append({
                 "symbol": sym,

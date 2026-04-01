@@ -36,24 +36,31 @@ class ExposureCoach:
         # Use the MORE CONSERVATIVE of the two as base
         base = min(top_ceiling, ftd_exposure)
 
-        # FTD state adjustments — more gradual
+        # FTD state adjustments
         if ftd_state == "CORRECTION":
-            base = min(base, 0.50)  # Reduce but don't panic
+            base = min(base, 0.40)  # Reduce but don't panic
         elif ftd_state == "FTD_CONFIRMED":
+            # FTD_CONFIRMED = market has passed the re-entry test. The top
+            # detector guards against extreme risk (top_risk>=80 override below)
+            # so don't also gate the FTD boost on top_ceiling here.
             ftd_quality = ftd_result.get("quality_score", 0)
-            if ftd_quality >= 70 and top_ceiling >= 0.50:
-                base = max(base, 0.75)  # Override: confirmed re-entry
+            if ftd_quality >= 70:
+                base = max(base, 0.80)  # Confirmed re-entry
             elif ftd_quality >= 40:
-                base = max(base, 0.55)
+                base = max(base, 0.70)
+            else:
+                base = max(base, 0.60)
         elif ftd_state in ("RALLY_ATTEMPT", "FTD_WINDOW"):
-            base = min(base, 0.55)  # Cautious but not shutdown
+            base = min(base, 0.65)  # More aggressive during rally (was 0.55)
 
-        # Top risk override: only cut hard on extreme readings
+        # Top risk override: only cut hard on extreme readings.
+        # Thresholds raised to avoid over-penalizing post-crash recoveries
+        # where death cross and low breadth lag the actual market recovery.
         top_risk = top_result.get("top_risk", 0)
-        if top_risk >= 85:
+        if top_risk >= 90:
             base = min(base, 0.25)
-        elif top_risk >= 70:
-            base = min(base, 0.45)
+        elif top_risk >= 80:
+            base = min(base, 0.40)
 
         # Determine action
         if base >= 0.55:
